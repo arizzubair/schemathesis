@@ -77,6 +77,12 @@ class GraphQLCase(Case):
 C = TypeVar("C", bound=Case)
 
 
+@attr.s()
+class GraphQLOperationDefinition(OperationDefinition):
+    field_name: str = attr.ib()
+    type_: graphql.GraphQLType = attr.ib()
+
+
 @attr.s()  # pragma: no mutate
 class GraphQLSchema(BaseSchema):
     def get_full_path(self, path: str) -> str:
@@ -102,32 +108,42 @@ class GraphQLSchema(BaseSchema):
     @property
     def operations_count(self) -> int:
         raw_schema = self.raw_schema["__schema"]
-        if "queryType" not in raw_schema:
-            return 0
-        query_type_name = raw_schema["queryType"]["name"]
-        for type_def in raw_schema.get("types", []):
-            if type_def["name"] == query_type_name:
-                return len(type_def["fields"])
-        return 0
+        total = 0
+        for type_name in ("queryType", "mutationType"):
+            type_def = raw_schema.get(type_name)
+            if type_def is not None:
+                query_type_name = type_def["name"]
+                for type_def in raw_schema.get("types", []):
+                    if type_def["name"] == query_type_name:
+                        total += len(type_def["fields"])
+        return total
 
     def get_all_operations(self) -> Generator[Result[APIOperation, InvalidSchema], None, None]:
         schema = self.client_schema
-        if schema.query_type is None:
-            return
-        for field_name, definition in schema.query_type.fields.items():
-            yield Ok(
-                APIOperation(
-                    base_url=self.get_base_url(),
-                    path=self.base_path,
-                    verbose_name=field_name,
-                    method="POST",
-                    app=self.app,
-                    schema=self,
-                    # Parameters are not yet supported
-                    definition=OperationDefinition(raw=definition, resolved=definition, scope="", parameters=[]),
-                    case_cls=GraphQLCase,
+        for operation_type in (schema.query_type, schema.mutation_type):
+            if operation_type is None:
+                continue
+            for field_name, definition in operation_type.fields.items():
+                yield Ok(
+                    APIOperation(
+                        base_url=self.get_base_url(),
+                        path=self.base_path,
+                        verbose_name=f"{operation_type.name}.{field_name}",
+                        method="POST",
+                        app=self.app,
+                        schema=self,
+                        # Parameters are not yet supported
+                        definition=GraphQLOperationDefinition(
+                            raw=definition,
+                            resolved=definition,
+                            scope="",
+                            parameters=[],
+                            type_=operation_type,
+                            field_name=field_name,
+                        ),
+                        case_cls=GraphQLCase,
+                    )
                 )
-            )
 
     def get_case_strategy(
         self,
@@ -184,7 +200,12 @@ def get_case_strategy(
     auth_storage: Optional[AuthStorage] = None,
     data_generation_method: DataGenerationMethod = DataGenerationMethod.default(),
 ) -> Any:
-    body = draw(gql_st.query(client_schema, fields=[operation.verbose_name]))
+    definition = cast(GraphQLOperationDefinition, operation.definition)
+    strategy = {
+        "Query": gql_st.queries,
+        "Mutation": gql_st.mutations,
+    }[definition.type_.name]
+    body = draw(strategy(client_schema, fields=[definition.field_name]))
     instance = GraphQLCase(body=body, operation=operation, data_generation_method=data_generation_method)  # type: ignore
     context = auth.AuthContext(
         operation=operation,
